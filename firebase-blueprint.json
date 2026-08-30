@@ -1,0 +1,50 @@
+{
+  "entities": {
+    "Journal": {
+      "title": "Journal Entry",
+      "description": "A user-isolated conversation summary and journal entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "title": { "type": "string" },
+        "summary": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "mood": { "type": "string" },
+        "actionItems": { "type": "array", "items": { "type": "string" } },
+        "turnsCount": { "type": "number" },
+        "conversation": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "summary", "createdAt"]
+    },
+    "ReflectionInsight": {
+      "title": "Weekly Reflection Insight",
+      "description": "Generated analytical reflection for a user's isolated journal history",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "period": { "type": "string" },
+        "recurringTopics": { "type": "array", "items": { "type": "string" } },
+        "highlights": { "type": "array", "items": { "type": "string" } },
+        "goals": { "type": "array", "items": { "type": "string" } },
+        "areasToReflect": { "type": "array", "items": { "type": "string" } },
+        "motivationalMessage": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["createdAt", "recurringTopics", "highlights", "goals", "areasToReflect", "motivationalMessage"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/journals/{journalId}": {
+      "schema": "Journal",
+      "description": "Private user journal entries containing multi-turn conversation summaries"
+    },
+    "/users/{userId}/reflections/{reflectionId}": {
+      "schema": "ReflectionInsight",
+      "description": "Private analytical weekly reflections generated across user's own journals"
+    }
+  }
+}
