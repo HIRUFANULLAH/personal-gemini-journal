@@ -14,7 +14,6 @@ import {
   ShieldCheck,
   Eye,
   EyeOff,
-  UserCheck,
   Sparkles,
   Zap,
   Check,
@@ -189,16 +188,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     } finally {
       setLoading(false);
     }
-  };
-
-  const handleQuickDemo = (demoEmail: string) => {
-    setEmail(demoEmail);
-    setPassword('Passphrase#2026');
-    setConfirmPassword('Passphrase#2026');
-    setEmailTouched(true);
-    setPasswordTouched(true);
-    setConfirmPasswordTouched(true);
-    setErrorMsg(null);
   };
 
   const handleModeSwitch = (newMode: 'signin' | 'signup') => {
@@ -510,34 +499,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             )}
           </button>
         </form>
-
-        {/* Quick Demo Pre-fill for testing */}
-        <div className="mt-5 sm:mt-6 pt-4 sm:pt-5 border-t border-stone-200">
-          <div className="text-[11px] text-stone-500 mb-2 flex items-center justify-between font-medium">
-            <span>Quick test accounts:</span>
-          </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-            <button
-              type="button"
-              onClick={() => handleQuickDemo('alex.researcher@example.com')}
-              className="py-2 px-2.5 bg-stone-50 hover:bg-stone-100 active:bg-stone-200 border border-stone-200 rounded-lg text-[11px] text-stone-700 text-left truncate flex items-center space-x-1.5 cursor-pointer shadow-2xs min-h-[38px]"
-            >
-              <UserCheck className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-              <span className="truncate">alex.researcher</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => handleQuickDemo('sam.creator@example.com')}
-              className="py-2 px-2.5 bg-stone-50 hover:bg-stone-100 active:bg-stone-200 border border-stone-200 rounded-lg text-[11px] text-stone-700 text-left truncate flex items-center space-x-1.5 cursor-pointer shadow-2xs min-h-[38px]"
-            >
-              <UserCheck className="w-3.5 h-3.5 text-amber-600 shrink-0" />
-              <span className="truncate">sam.creator</span>
-            </button>
-          </div>
-          <p className="text-[10px] text-stone-500 mt-1.5 text-center">
-            Pre-fills the form. These are not pre-registered: use Create Account first.
-          </p>
-        </div>
 
         {/* Trust & Security Badge */}
         <div className="mt-4 sm:mt-5 p-3 rounded-xl bg-stone-50 border border-stone-200 flex items-start space-x-2.5 text-[11px] text-stone-600">
