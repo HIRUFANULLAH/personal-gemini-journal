@@ -3,7 +3,6 @@ export interface AppUser {
   email: string | null;
   displayName: string | null;
   isAnonymous?: boolean;
-  isLocalVault?: boolean;
   getIdToken: () => Promise<string>;
 }
 

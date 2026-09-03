@@ -1,24 +1,26 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
-import { 
-  getAuth, 
-  signInWithEmailAndPassword, 
-  createUserWithEmailAndPassword, 
+import {
+  getAuth,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
   signInAnonymously,
-  signOut as firebaseSignOut, 
+  signInWithPopup,
+  GoogleAuthProvider,
+  signOut as firebaseSignOut,
   onAuthStateChanged,
-  User
+  updateProfile,
+  User as FirebaseUser,
 } from 'firebase/auth';
-import { 
-  getFirestore, 
-  collection, 
-  doc, 
-  setDoc, 
-  getDocs, 
-  getDoc, 
-  deleteDoc, 
-  query, 
+import {
+  getFirestore,
+  collection,
+  doc,
+  setDoc,
+  getDocs,
+  deleteDoc,
+  query,
   orderBy,
-  serverTimestamp
+  serverTimestamp,
 } from 'firebase/firestore';
 import firebaseConfigJson from '../../firebase-applet-config.json';
 import { JournalEntry, WeeklyInsight, AppUser } from '../types';
@@ -34,134 +36,98 @@ const firebaseConfig = {
 
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 
-// Use explicit database ID if provisioned, or default
 export const auth = getAuth(app);
-export const db = firebaseConfigJson.firestoreDatabaseId && firebaseConfigJson.firestoreDatabaseId !== '(default)'
-  ? getFirestore(app, firebaseConfigJson.firestoreDatabaseId)
-  : getFirestore(app);
-
-// Local Vault Storage Keys
-const LOCAL_SESSION_KEY = 'gemini_journal_local_session';
-const LOCAL_CREDENTIALS_KEY = 'gemini_journal_vault_creds';
-const LOCAL_JOURNALS_PREFIX = 'gemini_journal_entries_';
-const LOCAL_INSIGHTS_PREFIX = 'gemini_journal_insights_';
-
-// Auth State Subscriptions for unified Firebase + Local Vault
-type AuthCallback = (user: AppUser | null) => void;
-const authListeners: Set<AuthCallback> = new Set();
-let currentLocalUser: AppUser | null = null;
+export const db =
+  firebaseConfigJson.firestoreDatabaseId && firebaseConfigJson.firestoreDatabaseId !== '(default)'
+    ? getFirestore(app, firebaseConfigJson.firestoreDatabaseId)
+    : getFirestore(app);
 
 /**
- * Computes SHA-256 hash with cryptographic salt for client-vault password verification
+ * Identity is established exclusively by Firebase Authentication.
+ *
+ * There is deliberately no local credential store. The API verifies every
+ * request with the Admin SDK against Google public signing certificates, so a
+ * client-minted identity could never be honoured by the backend anyway.
+ * Passwords are never hashed, stored, or transported by this application.
  */
-async function computePasswordHash(email: string, passwordPlain: string): Promise<string> {
-  const enc = new TextEncoder();
-  const data = enc.encode(`${email.toLowerCase().trim()}::${passwordPlain}::salt_gemini_vault_2026_isolated`);
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
-}
+const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt: 'select_account' });
 
-// Initialize local user from localStorage if present
-try {
-  const saved = localStorage.getItem(LOCAL_SESSION_KEY);
-  if (saved) {
-    const parsed = JSON.parse(saved);
-    if (parsed && parsed.uid) {
-      currentLocalUser = {
-        uid: parsed.uid,
-        email: parsed.email || null,
-        displayName: parsed.displayName || 'Vault User',
-        isLocalVault: true,
-        getIdToken: async () => `guest-token-${parsed.uid}`,
-      };
-    }
-  }
-} catch (e) {
-  console.warn('[Local Vault]: Could not load cached local session');
-}
-
-function notifyAuthListeners(user: AppUser | null) {
-  authListeners.forEach((cb) => cb(user));
-}
-
-/**
- * Universal Auth State Observer
- */
-export function subscribeToAuth(callback: AuthCallback): () => void {
-  authListeners.add(callback);
-
-  // If local user is already active and Firebase has no user
-  if (currentLocalUser && !auth.currentUser) {
-    callback(currentLocalUser);
-  }
-
-  const unsubscribeFirebase = onAuthStateChanged(auth, (firebaseUser) => {
-    if (firebaseUser) {
-      const appUser: AppUser = {
-        uid: firebaseUser.uid,
-        email: firebaseUser.email,
-        displayName: firebaseUser.displayName || (firebaseUser.isAnonymous ? 'Guest Reflecter' : null),
-        isAnonymous: firebaseUser.isAnonymous,
-        getIdToken: () => firebaseUser.getIdToken(),
-      };
-      callback(appUser);
-    } else if (currentLocalUser) {
-      callback(currentLocalUser);
-    } else {
-      callback(null);
-    }
-  });
-
-  return () => {
-    authListeners.delete(callback);
-    unsubscribeFirebase();
+function toAppUser(user: FirebaseUser): AppUser {
+  return {
+    uid: user.uid,
+    email: user.email,
+    displayName:
+      user.displayName ||
+      (user.isAnonymous ? 'Guest Reflector' : user.email?.split('@')[0] || null),
+    isAnonymous: user.isAnonymous,
+    getIdToken: () => user.getIdToken(),
   };
 }
 
 /**
- * Sign in as guest (tries Firebase Anonymous first, then Local Vault if console disabled)
+ * Translate Firebase auth errors into messages a user can act on.
+ * A disabled provider is a configuration problem rather than a credential
+ * problem, so it is called out explicitly instead of reported as a bad login.
  */
-export async function loginAsGuest(customIdentifier?: string): Promise<AppUser> {
+function describeAuthError(err: any): Error {
+  const code = err?.code || '';
+  const map: Record<string, string> = {
+    'auth/operation-not-allowed':
+      'This sign-in method is not enabled. Enable it in Firebase Console > Authentication > Sign-in method.',
+    'auth/admin-restricted-operation':
+      'This sign-in method is not enabled. Enable it in Firebase Console > Authentication > Sign-in method.',
+    'auth/invalid-credential': 'Invalid email or password.',
+    'auth/wrong-password': 'Invalid email or password.',
+    'auth/user-not-found': 'No account found with this email. Please sign up first.',
+    'auth/email-already-in-use': 'An account with this email already exists.',
+    'auth/weak-password': 'Password should be at least 6 characters.',
+    'auth/popup-closed-by-user': 'Sign-in window was closed before completing.',
+    'auth/popup-blocked': 'Your browser blocked the sign-in popup. Allow popups and try again.',
+    'auth/unauthorized-domain':
+      'This domain is not authorised. Add it under Authentication > Settings > Authorized domains.',
+  };
+  const e = new Error(map[code] || err?.message || 'Authentication failed.');
+  (e as any).code = code;
+  return e;
+}
+
+/**
+ * Auth state observer. Emits the signed-in user, or null when signed out.
+ */
+export function subscribeToAuth(callback: (user: AppUser | null) => void): () => void {
+  return onAuthStateChanged(auth, (firebaseUser) => {
+    callback(firebaseUser ? toAppUser(firebaseUser) : null);
+  });
+}
+
+/**
+ * Sign in with Google (OAuth popup). Preferred path: no password ever
+ * reaches this application.
+ */
+export async function signInWithGoogle(): Promise<AppUser> {
   try {
-    const cred = await signInAnonymously(auth);
-    const appUser: AppUser = {
-      uid: cred.user.uid,
-      email: null,
-      displayName: 'Guest Reflector',
-      isAnonymous: true,
-      getIdToken: () => cred.user.getIdToken(),
-    };
-    return appUser;
+    const cred = await signInWithPopup(auth, googleProvider);
+    return toAppUser(cred.user);
   } catch (err: any) {
-    const uid = customIdentifier ? `vault-${customIdentifier.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()}` : `guest-${Math.random().toString(36).substring(2, 9)}`;
-    const localUser: AppUser = {
-      uid,
-      email: customIdentifier?.includes('@') ? customIdentifier : 'guest.sandbox@local.vault',
-      displayName: customIdentifier?.split('@')[0] || 'Private Vault User',
-      isLocalVault: true,
-      getIdToken: async () => `guest-token-${uid}`,
-    };
-    currentLocalUser = localUser;
-    try {
-      localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify({
-        uid: localUser.uid,
-        email: localUser.email,
-        displayName: localUser.displayName,
-      }));
-    } catch {}
-    notifyAuthListeners(localUser);
-    return localUser;
+    throw describeAuthError(err);
   }
 }
 
 /**
- * Authenticate with Email & Password with STRICT password verification.
- * 1. Tries Firebase Authentication (Cloud). If successful, signs in.
- * 2. If Firebase fails with wrong password or invalid credential, it throws an error and NEVER logs in.
- * 3. If Firebase Email/Password provider is not yet enabled in Firebase Console (auth/operation-not-allowed),
- *    it strictly verifies against the local encrypted vault credentials (SHA-256 salted hash).
- *    Wrong passwords are strictly rejected!
+ * Sign in anonymously for a throwaway session.
+ */
+export async function loginAsGuest(): Promise<AppUser> {
+  try {
+    const cred = await signInAnonymously(auth);
+    return toAppUser(cred.user);
+  } catch (err: any) {
+    throw describeAuthError(err);
+  }
+}
+
+/**
+ * Email/password sign-in or registration, handled entirely by Firebase.
  */
 export async function authenticateWithEmailPassword(
   email: string,
@@ -169,232 +135,63 @@ export async function authenticateWithEmailPassword(
   mode: 'signin' | 'signup'
 ): Promise<AppUser> {
   const cleanEmail = email.trim().toLowerCase();
-
   try {
     if (mode === 'signup') {
       const cred = await createUserWithEmailAndPassword(auth, cleanEmail, passwordPlain);
-      const appUser: AppUser = {
-        uid: cred.user.uid,
-        email: cred.user.email,
-        displayName: cred.user.displayName || cleanEmail.split('@')[0],
-        isAnonymous: false,
-        getIdToken: () => cred.user.getIdToken(),
-      };
-      return appUser;
-    } else {
-      const cred = await signInWithEmailAndPassword(auth, cleanEmail, passwordPlain);
-      const appUser: AppUser = {
-        uid: cred.user.uid,
-        email: cred.user.email,
-        displayName: cred.user.displayName || cleanEmail.split('@')[0],
-        isAnonymous: false,
-        getIdToken: () => cred.user.getIdToken(),
-      };
-      return appUser;
-    }
-  } catch (firebaseErr: any) {
-    // If Firebase returns credential rejection (wrong password, account exists, etc.), throw immediately!
-    if (firebaseErr.code !== 'auth/operation-not-allowed') {
-      throw firebaseErr;
-    }
-
-    // Handle Local Vault credential verification when Firebase Console has not enabled Email/Password provider:
-    const enteredHash = await computePasswordHash(cleanEmail, passwordPlain);
-    let credsStore: Record<string, { hash: string; uid: string; createdAt: string }> = {};
-    try {
-      const raw = localStorage.getItem(LOCAL_CREDENTIALS_KEY);
-      if (raw) credsStore = JSON.parse(raw);
-    } catch {}
-
-    const existing = credsStore[cleanEmail];
-
-    if (mode === 'signup') {
-      if (existing) {
-        const customErr = new Error('An account with this email already exists.');
-        (customErr as any).code = 'auth/email-already-in-use';
-        throw customErr;
-      }
-      const uid = `vault-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-')}`;
-      credsStore[cleanEmail] = {
-        hash: enteredHash,
-        uid,
-        createdAt: new Date().toISOString(),
-      };
-      try {
-        localStorage.setItem(LOCAL_CREDENTIALS_KEY, JSON.stringify(credsStore));
-      } catch {}
-
-      const localUser: AppUser = {
-        uid,
-        email: cleanEmail,
-        displayName: cleanEmail.split('@')[0],
-        isLocalVault: true,
-        getIdToken: async () => `vault-token-${uid}`,
-      };
-      currentLocalUser = localUser;
-      try {
-        localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify({
-          uid: localUser.uid,
-          email: localUser.email,
-          displayName: localUser.displayName,
-        }));
-      } catch {}
-      notifyAuthListeners(localUser);
-      return localUser;
-    } else {
-      // Sign In mode
-      if (!existing) {
-        // Known quick-test accounts setup for convenience if never registered
-        if (cleanEmail === 'alex.researcher@example.com' || cleanEmail === 'sam.creator@example.com') {
-          const defaultSeedHash = await computePasswordHash(cleanEmail, 'Passphrase#2026');
-          if (enteredHash !== defaultSeedHash) {
-            const customErr = new Error('Invalid email or password.');
-            (customErr as any).code = 'auth/wrong-password';
-            throw customErr;
-          }
-          const uid = `vault-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-')}`;
-          credsStore[cleanEmail] = {
-            hash: defaultSeedHash,
-            uid,
-            createdAt: new Date().toISOString(),
-          };
-          try {
-            localStorage.setItem(LOCAL_CREDENTIALS_KEY, JSON.stringify(credsStore));
-          } catch {}
-        } else {
-          const customErr = new Error('No account found with this email. Please sign up first.');
-          (customErr as any).code = 'auth/user-not-found';
-          throw customErr;
+      const fallbackName = cleanEmail.split('@')[0];
+      if (!cred.user.displayName && fallbackName) {
+        try {
+          await updateProfile(cred.user, { displayName: fallbackName });
+        } catch {
+          /* display name is cosmetic, never block sign-up on it */
         }
       }
-
-      // STRICT Hash Verification
-      const record = credsStore[cleanEmail];
-      if (!record || record.hash !== enteredHash) {
-        const customErr = new Error('Invalid email or password.');
-        (customErr as any).code = 'auth/wrong-password';
-        throw customErr;
-      }
-
-      const uid = record.uid;
-      const localUser: AppUser = {
-        uid,
-        email: cleanEmail,
-        displayName: cleanEmail.split('@')[0],
-        isLocalVault: true,
-        getIdToken: async () => `vault-token-${uid}`,
-      };
-      currentLocalUser = localUser;
-      try {
-        localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify({
-          uid: localUser.uid,
-          email: localUser.email,
-          displayName: localUser.displayName,
-        }));
-      } catch {}
-      notifyAuthListeners(localUser);
-      return localUser;
+      return toAppUser(cred.user);
     }
+    const cred = await signInWithEmailAndPassword(auth, cleanEmail, passwordPlain);
+    return toAppUser(cred.user);
+  } catch (err: any) {
+    throw describeAuthError(err);
   }
 }
 
-/**
- * Sign in with local vault directly (deprecated in favor of authenticateWithEmailPassword)
- */
-export function loginWithLocalVault(email: string): AppUser {
-  const cleanEmail = email.trim().toLowerCase();
-  const uid = `vault-${cleanEmail.replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-')}`;
-  const localUser: AppUser = {
-    uid,
-    email: cleanEmail,
-    displayName: cleanEmail.split('@')[0],
-    isLocalVault: true,
-    getIdToken: async () => `vault-token-${uid}`,
-  };
-  currentLocalUser = localUser;
-  try {
-    localStorage.setItem(LOCAL_SESSION_KEY, JSON.stringify({
-      uid: localUser.uid,
-      email: localUser.email,
-      displayName: localUser.displayName,
-    }));
-  } catch {}
-  notifyAuthListeners(localUser);
-  return localUser;
-}
-
-/**
- * Sign out universal
- */
 export async function logoutUser(): Promise<void> {
-  currentLocalUser = null;
-  try {
-    localStorage.removeItem(LOCAL_SESSION_KEY);
-  } catch {}
-  try {
-    await firebaseSignOut(auth);
-  } catch (err) {
-    console.error('[Sign Out Error]:', err);
-  }
-  notifyAuthListeners(null);
+  await firebaseSignOut(auth);
 }
 
 /**
- * Get current user auth ID token for backend API authentication
+ * Current user Firebase ID token, for Authorization: Bearer <token>.
+ * The API rejects anything that is not a valid, signed Firebase token.
  */
 export async function getAuthToken(): Promise<string | null> {
   const user = auth.currentUser;
-  if (user) {
-    return await user.getIdToken();
-  }
-  if (currentLocalUser) {
-    return await currentLocalUser.getIdToken();
-  }
-  return null;
+  return user ? user.getIdToken() : null;
 }
 
-// ---------------- LOCAL STORAGE VAULT HELPERS ----------------
-
-function getLocalJournals(userId: string): JournalEntry[] {
-  try {
-    const raw = localStorage.getItem(LOCAL_JOURNALS_PREFIX + userId);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-
-function setLocalJournals(userId: string, entries: JournalEntry[]): void {
-  try {
-    localStorage.setItem(LOCAL_JOURNALS_PREFIX + userId, JSON.stringify(entries));
-  } catch {}
-}
-
-function getLocalInsights(userId: string): WeeklyInsight[] {
-  try {
-    const raw = localStorage.getItem(LOCAL_INSIGHTS_PREFIX + userId);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-
-function setLocalInsights(userId: string, insights: WeeklyInsight[]): void {
-  try {
-    localStorage.setItem(LOCAL_INSIGHTS_PREFIX + userId, JSON.stringify(insights));
-  } catch {}
-}
-
-// ---------------- DATA OPERATIONS ----------------
+// ---------------- DATA OPERATIONS (Firestore only) ----------------
 
 /**
- * Save journal entry under isolated user subcollection: users/{uid}/journals/{journalId}
+ * Guard every read and write against the signed-in identity. This mirrors the
+ * Firestore rules client-side so an ownership violation fails fast and loudly
+ * rather than as an opaque permission error.
+ */
+function requireOwner(userId: string): void {
+  const current = auth.currentUser;
+  if (!current || current.uid !== userId) {
+    throw new Error('Not authenticated for this user.');
+  }
+}
+
+/**
+ * Persist a journal entry to users/{uid}/journals/{journalId}.
+ * Field limits mirror firestore.rules so a rejected write fails fast.
  */
 export async function saveJournalEntry(
   userId: string,
   entry: Omit<JournalEntry, 'id' | 'userId' | 'createdAt' | 'updatedAt'>,
   customId?: string
 ): Promise<string> {
+  requireOwner(userId);
   const nowIso = new Date().toISOString();
   const entryId = customId || `journal_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
@@ -413,105 +210,49 @@ export async function saveJournalEntry(
     updatedAt: nowIso,
   };
 
-  // Always mirror in local isolated vault
-  const localList = getLocalJournals(userId);
-  const updatedLocal = [fullEntry, ...localList.filter((j) => j.id !== entryId)];
-  setLocalJournals(userId, updatedLocal);
-
-  // If Firebase user is active, attempt Firestore sync
-  if (auth.currentUser && auth.currentUser.uid === userId) {
-    try {
-      const journalsCollectionRef = collection(db, 'users', userId, 'journals');
-      const journalDocRef = doc(journalsCollectionRef, entryId);
-      await setDoc(journalDocRef, {
-        ...fullEntry,
-        timestamp: serverTimestamp(),
-      });
-    } catch (err: any) {
-      console.warn('[Firestore Sync]: Could not sync to cloud, stored in local vault:', err?.message);
-    }
-  }
-
+  const journalDocRef = doc(collection(db, 'users', userId, 'journals'), entryId);
+  await setDoc(journalDocRef, { ...fullEntry, timestamp: serverTimestamp() });
   return entryId;
 }
 
 /**
- * Load all journals belonging ONLY to authenticated user
+ * Load journals belonging to the authenticated user. Firestore rules restrict
+ * this subtree to request.auth.uid == userId.
  */
 export async function getUserJournals(userId: string): Promise<JournalEntry[]> {
-  const localEntries = getLocalJournals(userId);
+  requireOwner(userId);
+  const journalsRef = collection(db, 'users', userId, 'journals');
+  const snapshot = await getDocs(query(journalsRef, orderBy('createdAt', 'desc')));
 
-  // If authenticated with Firebase user, fetch cloud and merge with local
-  if (auth.currentUser && auth.currentUser.uid === userId) {
-    try {
-      const journalsRef = collection(db, 'users', userId, 'journals');
-      const q = query(journalsRef, orderBy('createdAt', 'desc'));
-      const querySnapshot = await getDocs(q);
-      const cloudResults: JournalEntry[] = [];
-      querySnapshot.forEach((docSnap) => {
-        const data = docSnap.data();
-        cloudResults.push({
-          id: docSnap.id,
-          userId: data.userId || userId,
-          title: data.title || 'Untitled Journal',
-          summary: data.summary || '',
-          mood: data.mood || 'Reflective',
-          tags: data.tags || [],
-          keyTakeaways: data.keyTakeaways || [],
-          actionItems: data.actionItems || [],
-          turnsCount: data.turnsCount || 0,
-          conversation: data.conversation || [],
-          createdAt: data.createdAt || new Date().toISOString(),
-          updatedAt: data.updatedAt || new Date().toISOString(),
-        });
-      });
-
-      // Merge cloud and local unique entries
-      const map = new Map<string, JournalEntry>();
-      cloudResults.forEach((j) => map.set(j.id, j));
-      localEntries.forEach((j) => {
-        if (!map.has(j.id)) map.set(j.id, j);
-      });
-
-      return Array.from(map.values()).sort(
-        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-      );
-    } catch (error) {
-      console.warn('[Firestore Query]: Falling back to local vault storage:', error);
-    }
-  }
-
-  return localEntries.sort(
-    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-  );
+  return snapshot.docs.map((docSnap) => {
+    const data = docSnap.data();
+    return {
+      id: docSnap.id,
+      userId: data.userId || userId,
+      title: data.title || 'Untitled Journal',
+      summary: data.summary || '',
+      mood: data.mood || 'Reflective',
+      tags: data.tags || [],
+      keyTakeaways: data.keyTakeaways || [],
+      actionItems: data.actionItems || [],
+      turnsCount: data.turnsCount || 0,
+      conversation: data.conversation || [],
+      createdAt: data.createdAt || new Date().toISOString(),
+      updatedAt: data.updatedAt || new Date().toISOString(),
+    } as JournalEntry;
+  });
 }
 
-/**
- * Delete a user's isolated journal
- */
 export async function deleteUserJournal(userId: string, journalId: string): Promise<void> {
-  // Delete from local vault
-  const localList = getLocalJournals(userId);
-  setLocalJournals(userId, localList.filter((j) => j.id !== journalId));
-
-  // Delete from cloud if authenticated
-  if (auth.currentUser && auth.currentUser.uid === userId) {
-    try {
-      const docRef = doc(db, 'users', userId, 'journals', journalId);
-      await deleteDoc(docRef);
-    } catch (err: any) {
-      console.warn('[Firestore Delete]: Error deleting from cloud:', err?.message);
-    }
-  }
+  requireOwner(userId);
+  await deleteDoc(doc(db, 'users', userId, 'journals', journalId));
 }
 
-/**
- * Save generated weekly reflection insight
- */
 export async function saveWeeklyInsight(
   userId: string,
   insight: Omit<WeeklyInsight, 'id' | 'userId' | 'createdAt'>
 ): Promise<string> {
+  requireOwner(userId);
   const nowIso = new Date().toISOString();
   const insightId = `insight_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
@@ -528,67 +269,30 @@ export async function saveWeeklyInsight(
     createdAt: nowIso,
   };
 
-  const localList = getLocalInsights(userId);
-  setLocalInsights(userId, [fullInsight, ...localList]);
-
-  if (auth.currentUser && auth.currentUser.uid === userId) {
-    try {
-      const reflectionsRef = collection(db, 'users', userId, 'reflections');
-      const newDocRef = doc(reflectionsRef, insightId);
-      await setDoc(newDocRef, {
-        ...fullInsight,
-        timestamp: serverTimestamp(),
-      });
-    } catch (err) {
-      console.warn('[Firestore Insight Sync]: Stored locally:', err);
-    }
-  }
-
+  const insightRef = doc(collection(db, 'users', userId, 'reflections'), insightId);
+  await setDoc(insightRef, { ...fullInsight, timestamp: serverTimestamp() });
   return insightId;
 }
 
-/**
- * Load user's saved weekly insights
- */
 export async function getUserWeeklyInsights(userId: string): Promise<WeeklyInsight[]> {
-  const localInsights = getLocalInsights(userId);
+  requireOwner(userId);
+  const snapshot = await getDocs(collection(db, 'users', userId, 'reflections'));
 
-  if (auth.currentUser && auth.currentUser.uid === userId) {
-    try {
-      const reflectionsRef = collection(db, 'users', userId, 'reflections');
-      const snapshot = await getDocs(reflectionsRef);
-      const cloudResults: WeeklyInsight[] = [];
-      snapshot.forEach((docSnap) => {
-        const data = docSnap.data();
-        cloudResults.push({
-          id: docSnap.id,
-          userId: data.userId || userId,
-          period: data.period || 'Recent Week',
-          journalCount: data.journalCount || 0,
-          recurringTopics: data.recurringTopics || [],
-          highlights: data.highlights || [],
-          goals: data.goals || [],
-          areasToReflect: data.areasToReflect || [],
-          motivationalMessage: data.motivationalMessage || '',
-          createdAt: data.createdAt || new Date().toISOString(),
-        });
-      });
-
-      const map = new Map<string, WeeklyInsight>();
-      cloudResults.forEach((i) => map.set(i.id, i));
-      localInsights.forEach((i) => {
-        if (!map.has(i.id)) map.set(i.id, i);
-      });
-
-      return Array.from(map.values()).sort(
-        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-      );
-    } catch (err) {
-      console.warn('[Firestore Insights]: Falling back to local store:', err);
-    }
-  }
-
-  return localInsights.sort(
-    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-  );
+  return snapshot.docs
+    .map((docSnap) => {
+      const data = docSnap.data();
+      return {
+        id: docSnap.id,
+        userId: data.userId || userId,
+        period: data.period || 'Recent Week',
+        journalCount: data.journalCount || 0,
+        recurringTopics: data.recurringTopics || [],
+        highlights: data.highlights || [],
+        goals: data.goals || [],
+        areasToReflect: data.areasToReflect || [],
+        motivationalMessage: data.motivationalMessage || '',
+        createdAt: data.createdAt || new Date().toISOString(),
+      } as WeeklyInsight;
+    })
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 }

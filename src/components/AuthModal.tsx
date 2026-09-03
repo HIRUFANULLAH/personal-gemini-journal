@@ -1,7 +1,8 @@
 import React, { useState, useMemo } from 'react';
 import { 
   loginAsGuest, 
-  authenticateWithEmailPassword 
+  authenticateWithEmailPassword,
+  signInWithGoogle
 } from '../lib/firebase';
 import { 
   Lock, 
@@ -164,14 +165,27 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   };
 
+  const handleGoogleLogin = async () => {
+    setLoading(true);
+    setErrorMsg(null);
+    try {
+      await signInWithGoogle();
+      onSuccess();
+    } catch (err: any) {
+      setErrorMsg(err?.message || 'Google sign-in failed. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleGuestLogin = async () => {
     setLoading(true);
     setErrorMsg(null);
     try {
-      await loginAsGuest(email || undefined);
+      await loginAsGuest();
       onSuccess();
     } catch (err: any) {
-      setErrorMsg('Unable to initialize guest session. Please try again.');
+      setErrorMsg(err?.message || 'Unable to initialize guest session. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -212,6 +226,29 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               ? 'Sign in to access your isolated, encrypted personal journal vault.'
               : 'Register for private, user-isolated journaling with Gemini & Firestore.'}
           </p>
+        </div>
+
+        {/* Primary: federated sign-in. No password is handled by this app. */}
+        <button
+          id="btn-google-signin"
+          type="button"
+          disabled={loading}
+          onClick={handleGoogleLogin}
+          className="w-full py-3 px-4 mb-4 bg-white hover:bg-stone-50 active:bg-stone-100 border border-stone-300 rounded-xl text-sm font-semibold text-stone-700 flex items-center justify-center space-x-2.5 transition-all shadow-xs disabled:opacity-50 cursor-pointer min-h-[46px]"
+        >
+          <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+            <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" />
+            <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.65l-3.57-2.77c-.99.66-2.26 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84A11 11 0 0 0 12 23z" />
+            <path fill="#FBBC05" d="M5.84 14.11a6.6 6.6 0 0 1 0-4.22V7.05H2.18a11 11 0 0 0 0 9.9l3.66-2.84z" />
+            <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1a11 11 0 0 0-9.82 6.05l3.66 2.84c.87-2.6 3.3-4.51 6.16-4.51z" />
+          </svg>
+          <span>Continue with Google</span>
+        </button>
+
+        <div className="flex items-center gap-3 mb-4">
+          <div className="h-px flex-1 bg-stone-200" />
+          <span className="text-[10px] uppercase tracking-wider text-stone-400 font-semibold">or</span>
+          <div className="h-px flex-1 bg-stone-200" />
         </div>
 
         {/* Instant Access Banner */}
@@ -498,7 +535,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
             </button>
           </div>
           <p className="text-[10px] text-stone-500 mt-1.5 text-center">
-            Pre-fills credentials. Click "Instant Sandbox Access" or submit form.
+            Pre-fills the form. These are not pre-registered: use Create Account first.
           </p>
         </div>
 
