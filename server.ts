@@ -3,12 +3,16 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
+import { initializeApp as initAdminApp, type App as AdminApp } from 'firebase-admin/app';
+import { getAuth as getAdminAuth } from 'firebase-admin/auth';
+import firebaseConfigJson from './firebase-applet-config.json';
 import { SecretManagerServiceClient } from '@google-cloud/secret-manager';
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+// Cloud Run (and most PaaS hosts) inject the port to bind via PORT.
+const PORT = Number(process.env.PORT) || 3000;
 
 // Body parser with safe limits to prevent payload exhaustion
 app.use(express.json({ limit: '1mb' }));
@@ -43,6 +47,13 @@ async function getGeminiApiKey(): Promise<string> {
   if (gcpProjectId && !process.env.GEMINI_API_KEY) {
     try {
       const secretClient = new SecretManagerServiceClient();
+
+      // Preflight the Application Default Credentials BEFORE issuing any RPC.
+      // A failed accessSecretVersion() call surfaces a second, unhandled rejection
+      // from the underlying gax client that terminates the process, so an
+      // unauthenticated environment must never reach the RPC at all.
+      await secretClient.auth.getClient();
+
       const secretPath = `projects/${gcpProjectId}/secrets/${secretName}/versions/latest`;
       const [version] = await secretClient.accessSecretVersion({ name: secretPath });
       const payload = version.payload?.data?.toString();
@@ -79,8 +90,29 @@ async function getAI(): Promise<GoogleGenAI> {
 }
 
 /**
- * Authentication verification middleware:
- * Validates Firebase ID token or authenticated local vault token from Authorization: Bearer <idToken>
+ * Firebase Admin app used solely for ID token verification.
+ * Signature verification relies on Google's PUBLIC signing certificates, so this
+ * requires only a project ID - no service account key, no ADC. The project ID
+ * additionally pins the accepted `aud` and `iss` claims.
+ */
+const ADMIN_PROJECT_ID = process.env.GCP_PROJECT_ID || firebaseConfigJson.projectId;
+let adminApp: AdminApp | null = null;
+
+function getAdminApp(): AdminApp {
+  if (!adminApp) {
+    adminApp = initAdminApp({ projectId: ADMIN_PROJECT_ID }, 'journal-auth');
+  }
+  return adminApp;
+}
+
+/**
+ * Authentication verification middleware.
+ *
+ * Every request must present a Firebase ID token that is cryptographically
+ * verified via the Admin SDK. A token is rejected unless its RS256 signature
+ * matches a current Google signing certificate AND its aud/iss/exp claims are
+ * valid for this project. The uid is taken ONLY from the verified payload, so a
+ * caller cannot assert an identity it does not hold.
  */
 async function verifyFirebaseToken(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization;
@@ -95,75 +127,23 @@ async function verifyFirebaseToken(req: AuthenticatedRequest, res: Response, nex
     return;
   }
 
-  // Handle local sandbox / authenticated vault / guest tokens
-  if (
-    idToken.startsWith('vault-token-') ||
-    idToken.startsWith('guest-token-') ||
-    idToken.startsWith('sandbox-') ||
-    idToken.startsWith('demo-') ||
-    idToken.startsWith('local-')
-  ) {
-    const rawUid = idToken.replace(/^(vault-token-|guest-token-|sandbox-|demo-|local-)/, '');
-    req.user = {
-      uid: rawUid || 'authenticated-user',
-      email: `${rawUid || 'user'}@personaljournal.local`,
-    };
-    next();
-    return;
-  }
-
-  // Decode standard 3-part JWT (Firebase ID token)
-  const parts = idToken.split('.');
-  if (parts.length === 3) {
-    try {
-      // Decode JWT payload (base64 or base64url)
-      const base64Payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-      const payloadJson = Buffer.from(base64Payload, 'base64').toString('utf8');
-      const payload = JSON.parse(payloadJson);
-
-      const uid = payload.user_id || payload.sub || payload.uid;
-      if (uid) {
-        // Enforce expiration check (with 5 min clock skew buffer)
-        if (payload.exp && typeof payload.exp === 'number') {
-          const nowSec = Math.floor(Date.now() / 1000);
-          if (payload.exp < nowSec - 300) {
-            res.status(401).json({ error: 'Unauthorized: Authentication token has expired.' });
-            return;
-          }
-        }
-
-        req.user = {
-          uid,
-          email: payload.email,
-        };
-        next();
-        return;
-      }
-    } catch (jwtErr: any) {
-      console.warn('[Auth] JWT decode failed:', jwtErr?.message);
-    }
-  }
-
   try {
-    // Attempt tokeninfo lookup for Google Sign-In tokens if applicable
-    const response = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
-    if (response.ok) {
-      const data = await response.json();
-      const uid = data.user_id || data.sub;
-      if (uid) {
-        req.user = {
-          uid,
-          email: data.email,
-        };
-        next();
-        return;
-      }
+    const decoded = await getAdminAuth(getAdminApp()).verifyIdToken(idToken);
+    if (!decoded?.uid) {
+      res.status(401).json({ error: 'Unauthorized: Token contained no subject.' });
+      return;
     }
-  } catch (error: any) {
-    console.error('[Auth Error] Tokeninfo lookup error:', error?.message);
+    req.user = { uid: decoded.uid, email: decoded.email };
+    next();
+  } catch (err: any) {
+    const code = err?.code || 'auth/invalid-token';
+    console.warn(`[Auth] Rejected token: ${code}`);
+    if (code === 'auth/id-token-expired') {
+      res.status(401).json({ error: 'Unauthorized: Authentication token has expired.' });
+      return;
+    }
+    res.status(401).json({ error: 'Unauthorized: Authentication token verification failed.' });
   }
-
-  res.status(401).json({ error: 'Unauthorized: Authentication token verification failed.' });
 }
 
 // ---------------------- API ROUTES ----------------------
